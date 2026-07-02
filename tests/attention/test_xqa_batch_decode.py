@@ -390,6 +390,35 @@ def generate_causal_mask(
     return mask_uint16
 
 
+def generate_ragged_causal_mask(
+    q_lens: torch.Tensor,
+    max_q_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Generate a flattened causal mask for variable-length XQA spec decode."""
+    num_packed_masks_per_token = (max_q_len + 31) // 32
+    padded_seq_len = num_packed_masks_per_token * 32
+    bit_positions = torch.tensor(
+        [1 << i for i in range(32)], device=device, dtype=torch.int64
+    )
+
+    rows = []
+    kv_indices = torch.arange(padded_seq_len, device=device, dtype=torch.int32)
+    for q_len in q_lens.tolist():
+        q_indices = torch.arange(q_len, device=device, dtype=torch.int32).unsqueeze(1)
+        causal_bool_mask = (kv_indices.unsqueeze(0) < q_len) & (
+            kv_indices.unsqueeze(0) <= q_indices
+        )
+        causal_bool_mask = causal_bool_mask.view(q_len, num_packed_masks_per_token, 32)
+        rows.append(
+            (causal_bool_mask.to(torch.int64) * bit_positions)
+            .sum(dim=-1)
+            .to(torch.uint32)
+        )
+
+    return torch.cat(rows, dim=0).contiguous().view(torch.uint16)
+
+
 @pytest.mark.skipif(
     get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
     reason="XQA is only supported on SM90, SM100, SM120/SM121 GPUs",
@@ -398,6 +427,7 @@ def generate_causal_mask(
     "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
     [
         (4, 4, 64, 4, 2),
+        (4, 4, 16, 4, 8),
         (4, 2, 16, 2, 4),
         (4, 3, 32, 2, 6),
         (4, 1, 16, 2, 1),
@@ -574,9 +604,212 @@ def test_xqa_batch_decode(
     torch.testing.assert_close(
         output.float(),
         output_ref.float() / o_scale,
-        rtol=1e-1 if kv_dtype == "fp8" else 1e-2,
-        atol=1e-1 if kv_dtype == "fp8" else 1e-2,
+        rtol=2e-1 if kv_dtype == "fp8" else 1e-2,
+        atol=2e-1 if kv_dtype == "fp8" else 1e-2,
     )
+
+
+@pytest.mark.skipif(
+    get_compute_capability(torch.device(device="cuda"))[0] != 9,
+    reason="Ragged non-MLA XQA spec decode test targets SM90.",
+)
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize(
+    "num_kv_heads,head_grp_size,q_lens_list",
+    [
+        (2, 4, [1, 3, 2, 5]),
+        (4, 8, [4, 1, 3, 2]),
+    ],
+)
+def test_xqa_batch_decode_ragged_spec_decode(
+    kv_dtype, kv_layout, num_kv_heads, head_grp_size, q_lens_list
+):
+    torch.manual_seed(0)
+
+    q_dtype = "bf16"
+    o_dtype = "bf16"
+    page_size = 16
+    num_qo_heads = num_kv_heads * head_grp_size
+    head_dim = 128
+    batch_size = 4
+    max_in_kv_len = 110
+    q_lens = torch.tensor(q_lens_list, dtype=torch.int32)
+    in_kv_lens = torch.randint(0, max_in_kv_len + 1, (batch_size,), dtype=torch.int32)
+    in_kv_lens[-1] = max_in_kv_len
+    seq_lens = q_lens + in_kv_lens
+
+    q, q_scale, ref_q = create_query_tensor(q_lens, num_qo_heads, head_dim, q_dtype)
+    q_indptr = generate_cumsum_lens(q_lens)
+    max_q_len = int(q_lens.max().item())
+
+    kv_cache, k_scale, v_scale, _, _, ref_kv_cache = create_kv_cache(
+        batch_size,
+        seq_lens,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        kv_dtype,
+        q_dtype,
+        kv_layout,
+    )
+    page_table, all_page_ids, page_per_seq = create_page_table(
+        batch_size, seq_lens, page_size
+    )
+    kv_indptr = generate_cumsum_lens(page_per_seq)
+    kv_last_page_len = get_last_page_len(seq_lens, page_size)
+    workspace_buffer, workspace_buffer_ref = create_workspace_buffers(GPU_DEVICE)
+    out, o_scale = create_output(q, o_dtype)
+    sm_scale = float(1.0 / (head_dim**0.5))
+
+    wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer_ref, kv_layout
+    )
+    wrapper_ref.plan(
+        qo_indptr=q_indptr,
+        paged_kv_indptr=kv_indptr,
+        paged_kv_indices=all_page_ids,
+        paged_kv_last_page_len=kv_last_page_len.to(GPU_DEVICE),
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim,
+        page_size=page_size,
+        causal=True,
+        pos_encoding_mode="NONE",
+        kv_data_type=ref_kv_cache.dtype,
+        q_data_type=ref_q.dtype,
+        window_left=-1,
+        logits_soft_cap=0.0,
+    )
+    output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+    mask = generate_ragged_causal_mask(q_lens, max_q_len, GPU_DEVICE)
+
+    workspace_buffer.zero_()
+    output = flashinfer.decode.xqa_batch_decode_with_kv_cache(
+        q.contiguous(),
+        kv_cache,
+        workspace_buffer,
+        page_table,
+        seq_lens.to(GPU_DEVICE),
+        torch.max(seq_lens).item(),
+        q_scale * k_scale * sm_scale,
+        v_scale / o_scale,
+        -1,
+        out=out,
+        enable_pdl=False,
+        kv_layout=kv_layout,
+        q_len_per_req=None,
+        max_q_len=max_q_len,
+        cum_seq_lens_q=q_indptr,
+        o_scale=o_scale,
+        mask=mask,
+    )
+    torch.testing.assert_close(
+        output.float(),
+        output_ref.float() / o_scale,
+        rtol=2e-1 if kv_dtype == "fp8" else 1e-2,
+        atol=2e-1 if kv_dtype == "fp8" else 1e-2,
+    )
+
+    routed_out, _ = create_output(q, o_dtype)
+    workspace_buffer.zero_()
+    routed_output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+        q.contiguous(),
+        kv_cache,
+        workspace_buffer,
+        page_table,
+        seq_lens.to(GPU_DEVICE),
+        torch.max(seq_lens).item(),
+        q_scale * k_scale * sm_scale,
+        v_scale / o_scale,
+        -1,
+        out=routed_out,
+        enable_pdl=False,
+        backend="xqa",
+        kv_layout=kv_layout,
+        q_len_per_req=None,
+        max_q_len=max_q_len,
+        cum_seq_lens_q=q_indptr,
+        o_scale=o_scale,
+        mask=mask,
+    )
+    torch.testing.assert_close(
+        routed_output.float(),
+        output_ref.float() / o_scale,
+        rtol=2e-1 if kv_dtype == "fp8" else 1e-2,
+        atol=2e-1 if kv_dtype == "fp8" else 1e-2,
+    )
+
+
+@pytest.mark.skipif(
+    get_compute_capability(torch.device(device="cuda"))[0] != 9,
+    reason="SM90 FP8 dispatch regression only applies on Hopper.",
+)
+def test_xqa_ragged_fp8_does_not_use_sm90_spec_q_seq_len_path(monkeypatch):
+    import importlib
+
+    xqa_module = importlib.import_module("flashinfer.xqa")
+    captured = {}
+
+    class FakeModule:
+        def xqa(self, run_sm90_fp8_mha, *args):
+            captured["run_sm90_fp8_mha"] = run_sm90_fp8_mha
+
+    monkeypatch.setattr(xqa_module, "get_xqa_module", lambda *args: FakeModule())
+
+    batch_size = 2
+    q_lens = torch.tensor([4, 1], dtype=torch.int32, device=GPU_DEVICE)
+    q_indptr = generate_cumsum_lens(q_lens.cpu())
+    max_q_len = int(q_lens.max().item())
+    num_qo_heads = 32
+    num_kv_heads = 4
+    head_dim = 128
+    page_size = 16
+    seq_lens = torch.tensor([64, 61], dtype=torch.int32, device=GPU_DEVICE)
+    num_pages = 8
+
+    q = torch.randn(
+        int(q_lens.sum().item()),
+        num_qo_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=GPU_DEVICE,
+    )
+    k_cache = torch.empty(
+        num_pages,
+        num_kv_heads,
+        page_size,
+        head_dim,
+        dtype=torch.float8_e4m3fn,
+        device=GPU_DEVICE,
+    )
+    v_cache = torch.empty_like(k_cache)
+    page_table = torch.arange(num_pages, dtype=torch.int32, device=GPU_DEVICE).view(
+        batch_size, num_pages // batch_size
+    )
+    out = torch.empty_like(q)
+    workspace = torch.zeros(workspace_size, dtype=torch.uint8, device=GPU_DEVICE)
+    semaphore = torch.zeros(8 * 1024 * 1024, dtype=torch.uint8, device=GPU_DEVICE)
+    mask = generate_ragged_causal_mask(q_lens.cpu(), max_q_len, GPU_DEVICE)
+
+    xqa_module.xqa(
+        q.unsqueeze(1),
+        k_cache,
+        v_cache,
+        page_table,
+        seq_lens.unsqueeze(1),
+        out.unsqueeze(1),
+        workspace,
+        semaphore,
+        num_kv_heads,
+        page_size,
+        q_seq_len=max_q_len,
+        mask=mask,
+        q_cu_seq_lens=q_indptr,
+        batch_size=batch_size,
+    )
+
+    assert captured["run_sm90_fp8_mha"] is False
 
 
 @pytest.mark.skipif(

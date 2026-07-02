@@ -2609,12 +2609,12 @@ def trtllm_batch_decode_with_kv_cache(
 
     max_q_len: Optional[int] = None
         The maximum query sequence length across all requests when using variable-length queries.
-        Only supported by trtllm-gen backend. Must be provided together with ``cum_seq_lens_q``.
+        Must be provided together with ``cum_seq_lens_q``.
         When None, all requests use uniform query length specified by ``q_len_per_req``.
 
     cum_seq_lens_q : Optional[torch.Tensor] = None
         Cumulative query sequence lengths for variable-length query support, shape: ``[batch_size + 1]``, dtype: ``torch.int32``.
-        Only supported by trtllm-gen backend. Must be provided together with ``max_q_len``.
+        Must be provided together with ``max_q_len``.
         When None, all requests use uniform query length specified by ``q_len_per_req``.
 
     skip_softmax_threshold_scale_factor: Optional[float] = None
@@ -2716,8 +2716,14 @@ def trtllm_batch_decode_with_kv_cache(
             raise ValueError("xqa backend does not support nvfp4 output")
         if o_sf_scale is not None or o_sf_vec_size is not None:
             raise ValueError("xqa backend does not support o_sf_scale or o_sf_vec_size")
-        if max_q_len is not None or cum_seq_lens_q is not None:
-            raise ValueError("xqa backend does not support cum_seq_lens_q")
+        if (max_q_len is None) != (cum_seq_lens_q is None):
+            raise ValueError(
+                "max_q_len and cum_seq_lens_q must be provided together for xqa"
+            )
+        if q_len_per_req is not None and cum_seq_lens_q is not None:
+            raise ValueError(
+                "q_len_per_req must be None when cum_seq_lens_q is provided"
+            )
         if not uses_shared_paged_kv_idx:
             raise ValueError(
                 "xqa backend does not support uses_shared_paged_kv_idx=False"
@@ -2750,6 +2756,8 @@ def trtllm_batch_decode_with_kv_cache(
             kv_layout=kv_layout,
             enable_pdl=enable_pdl,
             q_len_per_req=q_len_per_req,
+            max_q_len=max_q_len,
+            cum_seq_lens_q=cum_seq_lens_q,
             o_scale=o_scale,
             mask=mask,
         )
@@ -2937,6 +2945,8 @@ def xqa_batch_decode_with_kv_cache(
     kv_layout: str = "NHD",
     enable_pdl: bool = None,
     q_len_per_req: Optional[int] = 1,
+    max_q_len: Optional[int] = None,
+    cum_seq_lens_q: Optional[torch.Tensor] = None,
     o_scale: Optional[float] = 1.0,
     mask: Optional[torch.Tensor] = None,
     kv_cache_sf: Union[
@@ -2993,7 +3003,15 @@ def xqa_batch_decode_with_kv_cache(
     q_len_per_req : Optional[int] = 1
         Number of query tokens per request (i.e. speculative-decoding / MTP depth).
         ``query`` is expected to have ``batch_size * q_len_per_req`` rows along its
-        leading dimension.  Defaults to ``1``.
+        leading dimension.  Defaults to ``1``. Set to ``None`` when passing
+        variable query lengths via ``cum_seq_lens_q``.
+
+    max_q_len : Optional[int] = None
+        Maximum query length for variable-length speculative decoding.
+
+    cum_seq_lens_q : Optional[torch.Tensor] = None
+        Cumulative query lengths for variable-length speculative decoding,
+        shape ``[batch_size + 1]`` and dtype ``torch.int32``.
 
     o_scale : Optional[float] = 1.0
         output scale factor for fp8 output.
@@ -3060,7 +3078,21 @@ def xqa_batch_decode_with_kv_cache(
     kv_scale_value = bmm2_scale * o_scale
     q_scale_value = bmm1_scale / kv_scale_value * (head_dim**0.5)
 
-    if q_len_per_req > 1:
+    if (max_q_len is None) != (cum_seq_lens_q is None):
+        raise ValueError("max_q_len and cum_seq_lens_q must be provided together")
+    if q_len_per_req is not None and cum_seq_lens_q is not None:
+        raise ValueError("q_len_per_req must be None when cum_seq_lens_q is provided")
+
+    if q_len_per_req is None:
+        assert max_q_len is not None
+        assert cum_seq_lens_q is not None
+        batch_size = cum_seq_lens_q.size(0) - 1
+        q_seq_len = max_q_len
+    else:
+        q_seq_len = q_len_per_req
+        batch_size = query.shape[0] // q_len_per_req
+
+    if q_len_per_req is not None and q_len_per_req > 1:
         batch_size = query.shape[0] // q_len_per_req
         query = query.view(batch_size, q_len_per_req, query.shape[1], query.shape[2])
     query_new = query.unsqueeze(1)
@@ -3093,8 +3125,10 @@ def xqa_batch_decode_with_kv_cache(
         sm_count=sm_count,
         enable_pdl=enable_pdl,
         rcp_out_scale=1.0 / o_scale,
-        q_seq_len=q_len_per_req,
+        q_seq_len=q_seq_len,
         mask=mask,
+        q_cu_seq_lens=cum_seq_lens_q,
+        batch_size=batch_size,
     )
 
     return out

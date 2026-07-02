@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import os
 from types import SimpleNamespace
 from typing import Optional, Union
 import torch
@@ -86,6 +87,7 @@ def get_xqa_module(
         workspace_buffer: torch.Tensor,
         enable_pdl: bool,
         q_seq_len: int,
+        q_cu_seq_lens: Optional[torch.Tensor],
         mask: Optional[torch.Tensor],
     ) -> None:
         module.xqa_wrapper(
@@ -110,6 +112,7 @@ def get_xqa_module(
             1.0 if isinstance(kv_scale, torch.Tensor) else kv_scale,
             None if isinstance(kv_scale, float) else kv_scale,
             q_seq_len,
+            q_cu_seq_lens,
             mask,
             semaphores,
             workspace_buffer,
@@ -142,6 +145,7 @@ def get_xqa_module(
         workspace_buffer: torch.Tensor,
         enable_pdl: bool,
         q_seq_len: int,
+        q_cu_seq_lens: Optional[torch.Tensor],
         mask: Optional[torch.Tensor],
     ) -> None:
         pass
@@ -174,6 +178,8 @@ def xqa(
     q_seq_len: int = 1,
     mask: Optional[torch.Tensor] = None,
     *,
+    q_cu_seq_lens: Optional[torch.Tensor] = None,
+    batch_size: Optional[int] = None,
     k_sf_cache: Optional[torch.Tensor] = None,
     v_sf_cache: Optional[torch.Tensor] = None,
 ) -> None:
@@ -248,6 +254,14 @@ def xqa(
         Shape: ``[batch_size, q_seq_len, mask_size_per_row]`` where
         ``mask_size_per_row = ((q_seq_len + 31) // 32) * 2``.
         Data type should be torch.uint16 (bit-packed format, aligned to 32 bits).
+        When ``q_cu_seq_lens`` is provided, the mask is flattened over actual
+        query tokens with shape ``[q_cu_seq_lens[-1], mask_size_per_row]``.
+    q_cu_seq_lens : Optional[torch.Tensor], default=None
+        Cumulative query lengths for variable-length speculative decoding,
+        shape ``[batch_size + 1]`` and dtype ``torch.int32``.
+    batch_size : Optional[int], default=None
+        Request batch size. Required when ``q_cu_seq_lens`` is provided and the
+        leading query dimension is flattened across requests.
 
     Note
     ----
@@ -267,7 +281,7 @@ def xqa(
     enable_pdl = enable_pdl if enable_pdl is not None else device_support_pdl(q.device)
 
     # Infer parameters from tensors
-    batch_size = q.shape[0]
+    batch_size = q.shape[0] if batch_size is None else batch_size
     num_q_heads = q.shape[-2]
     head_dim = q.shape[-1]
 
@@ -302,6 +316,7 @@ def xqa(
     if (
         k_cache.dtype == torch.float8_e4m3fn
         and get_compute_capability(torch.device(device="cuda"))[0] == 9
+        and os.environ.get("FLASHINFER_XQA_DISABLE_SM90_FP8_MHA") != "1"
     ):
         run_sm90_fp8_mha = True
     else:
@@ -330,6 +345,11 @@ def xqa(
 
     if q_seq_len > 1:
         assert mask is not None, "Mask is required for speculative decoding"
+        if q_cu_seq_lens is not None:
+            # The optimized SM90 FP8 speculative kernel's SWAP_AB mask path is
+            # specialized for uniform SPEC_Q_SEQ_LEN and does not consume
+            # qCuSeqLens. Use the generic XQA path for ragged verification.
+            run_sm90_fp8_mha = False
         if sinks is not None:
             run_sm90_fp8_mha = False  # TODO: mha_sm90.cu has precision issue if sinks and speculative decoding are used simultaneously
 
@@ -356,6 +376,7 @@ def xqa(
         workspace_buffer,
         enable_pdl,
         q_seq_len,
+        q_cu_seq_lens,
         mask,
     )
 

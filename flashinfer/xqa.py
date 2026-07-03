@@ -43,6 +43,7 @@ def get_xqa_module(
     use_sliding_window: bool,
     output_dtype: torch.dtype,
     q_seq_len: int,
+    use_ragged_spec_dec: bool,
 ):
     module = gen_xqa_module(
         input_dtype,
@@ -53,6 +54,7 @@ def get_xqa_module(
         use_sliding_window,
         output_dtype,
         q_seq_len,
+        use_ragged_spec_dec,
     ).build_and_load()
 
     if q_seq_len > 1:
@@ -61,7 +63,7 @@ def get_xqa_module(
         use_spec_dec = False
 
     @register_custom_op(
-        f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}",
+        f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}_use_ragged_spec_dec_{use_ragged_spec_dec}",
         mutates_args=("output", "workspace_buffer"),
     )
     def xqa(
@@ -120,7 +122,7 @@ def get_xqa_module(
         )
 
     @register_fake_op(
-        f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}"
+        f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}_use_ragged_spec_dec_{use_ragged_spec_dec}"
     )
     def _fake_xqa(
         run_sm90_fp8_mha: bool,
@@ -341,15 +343,11 @@ def xqa(
         use_sliding_window,
         output.dtype,
         q_seq_len,
+        q_cu_seq_lens is not None,
     )
 
     if q_seq_len > 1:
         assert mask is not None, "Mask is required for speculative decoding"
-        if q_cu_seq_lens is not None:
-            # The optimized SM90 FP8 speculative kernel's SWAP_AB mask path is
-            # specialized for uniform SPEC_Q_SEQ_LEN and does not consume
-            # qCuSeqLens. Use the generic XQA path for ragged verification.
-            run_sm90_fp8_mha = False
         if sinks is not None:
             run_sm90_fp8_mha = False  # TODO: mha_sm90.cu has precision issue if sinks and speculative decoding are used simultaneously
 

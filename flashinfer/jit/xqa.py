@@ -40,6 +40,7 @@ def gen_xqa_module(
     use_sliding_window: bool,
     output_dtype: torch.dtype,
     q_seq_len: int = 1,
+    use_ragged_spec_dec: bool = False,
 ) -> JitSpec:
     if input_dtype == torch.float16:
         flag_input_dtype = ["-DINPUT_FP16=1", "-DDTYPE=__half"]
@@ -85,7 +86,7 @@ def gen_xqa_module(
 
     if q_seq_len > 1:
         use_spec_dec = True
-        if q_seq_len * head_group_ratio <= 32:
+        if not use_ragged_spec_dec and q_seq_len * head_group_ratio <= 32:
             flag_spec_dec = ["-DSPEC_DEC=1", f"-DSPEC_Q_SEQ_LEN={q_seq_len}"]
         else:
             flag_spec_dec = ["-DSPEC_DEC=1"]
@@ -118,7 +119,7 @@ def gen_xqa_module(
         flag_sm90_mha = ["-DUSE_SM90_MHA=0"]
 
     return gen_jit_spec(
-        f"xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}",
+        f"xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}_use_ragged_spec_dec_{use_ragged_spec_dec}",
         sources,
         extra_cuda_cflags=xqa_nvcc_flags
         + sm_nvcc_flags

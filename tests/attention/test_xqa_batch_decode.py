@@ -745,7 +745,7 @@ def test_xqa_batch_decode_ragged_spec_decode(
     get_compute_capability(torch.device(device="cuda"))[0] != 9,
     reason="SM90 FP8 dispatch regression only applies on Hopper.",
 )
-def test_xqa_ragged_fp8_does_not_use_sm90_spec_q_seq_len_path(monkeypatch):
+def test_xqa_ragged_fp8_uses_ragged_safe_sm90_path(monkeypatch):
     import importlib
 
     xqa_module = importlib.import_module("flashinfer.xqa")
@@ -755,7 +755,11 @@ def test_xqa_ragged_fp8_does_not_use_sm90_spec_q_seq_len_path(monkeypatch):
         def xqa(self, run_sm90_fp8_mha, *args):
             captured["run_sm90_fp8_mha"] = run_sm90_fp8_mha
 
-    monkeypatch.setattr(xqa_module, "get_xqa_module", lambda *args: FakeModule())
+    def fake_get_xqa_module(*args):
+        captured["get_xqa_module_args"] = args
+        return FakeModule()
+
+    monkeypatch.setattr(xqa_module, "get_xqa_module", fake_get_xqa_module)
 
     batch_size = 2
     q_lens = torch.tensor([4, 1], dtype=torch.int32, device=GPU_DEVICE)
@@ -809,7 +813,8 @@ def test_xqa_ragged_fp8_does_not_use_sm90_spec_q_seq_len_path(monkeypatch):
         batch_size=batch_size,
     )
 
-    assert captured["run_sm90_fp8_mha"] is False
+    assert captured["get_xqa_module_args"][-1] is True
+    assert captured["run_sm90_fp8_mha"] is True
 
 
 @pytest.mark.skipif(
